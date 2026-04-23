@@ -1,3 +1,5 @@
+import asyncio
+
 from bleak import BleakClient
 from functools import wraps
 from typing import Callable, Any, List, Tuple, Optional
@@ -241,7 +243,8 @@ class AsyncClient:
         """Connect to the device
         """
         self.client = BleakClient(self.address, disconnected_callback=self.disconnected_callback, adapter=self.adapter)
-        self.connected = await self.client.connect()
+        await self.client.connect()
+        self.connected = self.client.is_connected
 
     @requires_connection
     async def base_char_read(self, characteristic: str) -> bytearray:
@@ -278,7 +281,7 @@ class AsyncClient:
         if length == -1:
             raise ValueError('Characteristic not supported for write')
 
-        await self.client.write_gatt_char(uuid, data)
+        await self.client.write_gatt_char(uuid, data, response=True)
 
     @requires_connection
     async def disconnect(self) -> None:
@@ -306,6 +309,7 @@ class AsyncClient:
 
         try:
             await self.client.disconnect()
+            self.connected = False
         except (KeyboardInterrupt, SystemExit):
             raise
         except:  # noqa
@@ -328,7 +332,7 @@ class AsyncClient:
 
         :return: revision version
         """
-
+        print('! Getting firmware revision')
         return (await self.base_char_read('firmware_revision')).decode('ascii')
 
     @requires_connection
@@ -373,6 +377,8 @@ class AsyncClient:
         # float value to compare against
         firmware_revision = await self.firmware_revision()
         self.firmware_version = float(firmware_revision[4:8])
+
+        print('! Firmware version: {}'.format(self.firmware_version))
 
         if self.firmware_version >= 3.47:
             # Consistent functions between versions
@@ -669,11 +675,31 @@ class AsyncClient:
         await self.base_char_write('history_data', command)
 
         data = await self.base_char_read('history_data')
+        return self.decode_history_v4(data)
+
+    @staticmethod
+    def is_history_v4_terminator(data: bytearray) -> bool:
+        return len(data) >= 17 and data[0:17] == bytearray(17)
+
+    @staticmethod
+    def decode_history_v4(data: bytearray) -> Tuple[int, int, int, int]:
+        """Decode one TimeFlip2 history frame.
+
+        The v4 protocol stores one history event in the first 17 bytes:
+        event number (4 bytes), side/facet (1 byte), UTC flip timestamp
+        (8 bytes), and duration in seconds (4 bytes). Full-history
+        notification frames may append the previous event number after
+        those 17 bytes, so the decoder intentionally ignores trailing data.
+        """
+
+        if len(data) < 17:
+            raise ValueError('history frame should contain at least 17 bytes')
+
         return (
-            int.from_bytes(data[0:4], TIMEFLIP_ENDIANNESS),  # event number
+            int.from_bytes(data[0:4], TIMEFLIP_ENDIANNESS),
             data[4],
-            int.from_bytes(data[5:13], TIMEFLIP_ENDIANNESS),  # timestamp of flip(?)
-            int.from_bytes(data[13:18], 'little')  # duration of flip
+            int.from_bytes(data[5:13], TIMEFLIP_ENDIANNESS),
+            int.from_bytes(data[13:17], 'little')
         )
 
     @requires_login
@@ -682,32 +708,51 @@ class AsyncClient:
         """
         event_number = 0
 
-        _17zeros = bytearray(17)  # mark the end of history
+        history_blocks = []
+        done = asyncio.Event()
 
+        def history_callback(_sender, data):
+            if self.is_history_v4_terminator(data):
+                done.set()
+                return
+            history_blocks.append(self.decode_history_v4(data))
+
+        command = bytearray(5)
+        command[0] = 0x02
+        command[1:5] = event_number.to_bytes(4, 'big')
+
+        use_indexed_fallback = False
+        await self.client.start_notify(CHARACTERISTICS['history_data'], history_callback)
+        try:
+            await self.base_char_write('history_data', command)
+            await asyncio.wait_for(done.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            if history_blocks:
+                return history_blocks
+            use_indexed_fallback = True
+        finally:
+            await self.client.stop_notify(CHARACTERISTICS['history_data'])
+
+        if use_indexed_fallback:
+            return await self.get_all_history_v4_by_index()
+
+        return history_blocks
+
+    async def get_all_history_v4_by_index(self, max_events: int = 1024) -> List[Tuple[int, int, int, int]]:
         history_blocks = []
 
-        while True:
+        for event_number in range(max_events):
             command = bytearray(5)
-            command[0] = 0x02
+            command[0] = 0x01
             command[1:5] = event_number.to_bytes(4, 'big')
 
             await self.base_char_write('history_data', command)
-
             data = await self.base_char_read('history_data')
-
-            if data[0:17] == _17zeros:
+            if len(data) < 17:
                 break
-
-            history_blocks.append((
-                int.from_bytes(data[0:4], TIMEFLIP_ENDIANNESS),  # event number
-                data[4],
-                int.from_bytes(data[5:13], TIMEFLIP_ENDIANNESS),  # timestamp of flip(?)
-                int.from_bytes(data[13:18], 'little')  # duration of flip
-            ))
-
-            # increment bytes
-            event_number = event_number + 1
-            del command[:]
+            if self.is_history_v4_terminator(data):
+                break
+            history_blocks.append(self.decode_history_v4(data))
 
         return history_blocks
 
